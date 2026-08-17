@@ -1,0 +1,8 @@
+# DeepSeek API usage floating widget — self-contained profile patch.
+# Inserts one dual-face row (Host half: balance client + usage aggregator;
+# browser half: the shell.overlay floating widget, via the package's
+# `dsh.client` declaration).
+
+- insert:
+    - id: deepseek-usage-widget
+      name: '@deepseek-ai/dsh-deepseek-usage-widget'

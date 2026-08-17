@@ -1,0 +1,27 @@
+{
+  "extends": "../../../tsconfig.base.client.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "lib/types",
+    "tsBuildInfoFile": "lib/tsconfig.client.tsbuildinfo"
+  },
+  "files": [
+    "src/css-modules.d.ts",
+    "src/client/index.ts",
+    "src/client/widget.tsx"
+  ],
+  "references": [
+    {
+      "path": "../../../vendor/cordis"
+    },
+    {
+      "path": "../../client/ui-slots"
+    },
+    {
+      "path": "../../client/ui-layout"
+    },
+    {
+      "path": "../../client/runtime"
+    }
+  ]
+}
