@@ -5,8 +5,8 @@
  * credentials seam, fetches the official balance endpoint, incrementally folds
  * `assistant/message` usage events into per-day totals, persists both the
  * widget position and the daily cache through the storage domain, and serves
- * one JSON snapshot (plus a position write) over two package-owned HTTP routes.
- * The API key never leaves this process.
+ * one JSON snapshot (plus a position write and a manual refresh) over three
+ * package-owned HTTP routes. The API key never leaves this process.
  *
  * @module @deepseek-ai/dsh-deepseek-usage-widget
  */
@@ -116,7 +116,10 @@ export default class DeepSeekUsageWidgetService extends Service {
       for (const [key, value] of Object.entries(stored.daily)) this.daily.set(key, value)
     }
 
-    this.ctx.effect(() => () => { void this.domain?.close() }, 'deepseek-usage-widget: domain close')
+    this.ctx.effect(() => () => {
+      if (this.persistTimer !== undefined) clearTimeout(this.persistTimer)
+      void this.domain?.close()
+    }, 'deepseek-usage-widget: domain close')
     this.ctx.on('session/event', (_session, event: SessionEvent) => { this.observe(event) })
 
     this.ctx.effect(() => {
