@@ -2,12 +2,13 @@
  * DeepSeek API usage floating widget — Host half.
  *
  * Owns everything secret or durable: resolves `DEEPSEEK_API_KEY` through the
- * credentials seam, fetches the official balance endpoint, incrementally folds
- * `assistant/message` usage events into per-day, per-model totals, prices each
- * model with its own official rates, persists both the widget position and the
- * daily cache through the storage domain, and serves one JSON snapshot (plus a
- * position write and a manual refresh) over three package-owned HTTP routes.
- * The API key never leaves this process.
+ * credentials seam, fetches the official balance endpoint, optionally fetches
+ * the official per-day usage/cost from the platform dashboard (when a platform
+ * session token is configured), and still keeps a local per-day, per-model
+ * usage fold as a fallback. Persists the widget position and the daily cache
+ * through the storage domain, and serves one JSON snapshot (plus a position
+ * write and a manual refresh) over three package-owned HTTP routes. No secret
+ * ever leaves this process.
  *
  * @module @deepseek-ai/dsh-deepseek-usage-widget
  */
@@ -23,7 +24,9 @@ import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
 import { z } from 'zod'
 
 const BALANCE_ENDPOINT = 'https://api.deepseek.com/user/balance'
+const PLATFORM_BASE = 'https://platform.deepseek.com'
 const BALANCE_REFRESH_MS = 60_000
+const OFFICIAL_REFRESH_MS = 300_000
 const PERSIST_DEBOUNCE_MS = 2_000
 
 interface ModelPricing {
@@ -35,10 +38,7 @@ interface ModelPricing {
   output: number
 }
 
-/**
- * Official unit prices (CNY per 1M tokens), base flat rates.
- * Unknown models fall back to the default (deepseek-v4-flash) rate.
- */
+/** Official unit prices (CNY per 1M tokens) — used only for the local fallback. */
 const PRICING: Record<string, ModelPricing> = {
   'deepseek-v4-flash': { input: 1.0, cacheHit: 0.02, output: 2.0 },
   'deepseek-v4-pro': { input: 3.0, cacheHit: 0.025, output: 6.0 },
@@ -58,7 +58,6 @@ const dailyUsageSchema = z.object({
 
 type DailyUsage = z.infer<typeof dailyUsageSchema>
 
-/** The single durable record: widget position plus the whole daily fold. */
 const stateSchema = z.object({
   position: z.object({ x: z.number(), y: z.number() }),
   daily: z.record(z.string(), z.record(z.string(), dailyUsageSchema)),
@@ -85,6 +84,52 @@ interface BalanceState {
   error: string | undefined
 }
 
+/** One day of official usage, merged from the platform amount + cost endpoints. */
+interface OfficialDay {
+  date: string
+  cost: number
+  inputTokens: number
+  cacheReadTokens: number
+  outputTokens: number
+  requests: number
+}
+
+interface PlatformUsageEntry {
+  type?: string
+  amount?: string
+}
+
+interface PlatformModelUsage {
+  model?: string
+  usage?: PlatformUsageEntry[]
+}
+
+interface PlatformDay {
+  date?: string
+  data?: PlatformModelUsage[]
+}
+
+interface PlatformMonthData {
+  total?: PlatformModelUsage[]
+  days?: PlatformDay[]
+}
+
+interface PlatformUsageBody {
+  code?: number
+  msg?: string
+  data?: {
+    biz_data?: PlatformMonthData | PlatformMonthData[]
+  }
+}
+
+/** The `usage/cost` endpoint returns `biz_data` as an array; `usage/amount` returns it as an object. */
+function extractDays(body: PlatformUsageBody | undefined): PlatformDay[] {
+  const bizData = body?.data?.biz_data
+  if (bizData === undefined) return []
+  const month = Array.isArray(bizData) ? bizData[0] : bizData
+  return month?.days ?? []
+}
+
 function emptyBalance(kind: BalanceState['kind']): BalanceState {
   return { kind, available: undefined, currency: undefined, total: undefined, granted: undefined, toppedUp: undefined, updatedAt: undefined, error: undefined }
 }
@@ -98,10 +143,7 @@ function localDayKey(ms: number): string {
 
 function dayKeyToMs(key: string): number {
   const parts = key.split('-')
-  const y = Number(parts[0])
-  const m = Number(parts[1])
-  const d = Number(parts[2])
-  return new Date(y, m - 1, d).getTime()
+  return new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2])).getTime()
 }
 
 function estimateCost(u: DailyUsage, model: string): number {
@@ -118,6 +160,7 @@ export default class DeepSeekUsageWidgetService extends Service {
   private readonly daily = new Map<string, Map<string, DailyUsage>>()
   private readonly modelBySession = new Map<string, string>()
   private balance: BalanceState = emptyBalance('no-key')
+  private officialDays: OfficialDay[] = []
   private persistTimer: ReturnType<typeof setTimeout> | undefined
 
   constructor(ctx: Context) {
@@ -165,8 +208,11 @@ export default class DeepSeekUsageWidgetService extends Service {
     }, 'deepseek-usage-widget: routes')
 
     await this.refreshBalance()
+    await this.refreshOfficialUsage()
     const intervalId = setInterval(() => { void this.refreshBalance() }, BALANCE_REFRESH_MS)
     this.ctx.effect(() => () => { clearInterval(intervalId) }, 'deepseek-usage-widget: balance interval')
+    const officialInterval = setInterval(() => { void this.refreshOfficialUsage() }, OFFICIAL_REFRESH_MS)
+    this.ctx.effect(() => () => { clearInterval(officialInterval) }, 'deepseek-usage-widget: official interval')
   }
 
   private observe(sessionId: string, event: SessionEvent): void {
@@ -240,9 +286,6 @@ export default class DeepSeekUsageWidgetService extends Service {
           topped_up_balance?: string
         }>
       }
-      // DeepSeek may return one entry per currency (CNY + USD). Prefer the CNY
-      // entry, then the entry with the largest total, so a zero USD entry never
-      // masks a real CNY balance.
       const infos = body.balance_infos ?? []
       const info = infos.find(entry => (entry.currency ?? '').toUpperCase() === 'CNY')
         ?? infos.reduce<typeof infos[number] | undefined>((best, entry) => {
@@ -265,6 +308,86 @@ export default class DeepSeekUsageWidgetService extends Service {
       this.balance = previous.kind === 'success'
         ? { ...previous, error: message }
         : { ...emptyBalance('error'), error: message }
+    }
+  }
+
+  private async platformHeaders(): Promise<Record<string, string> | undefined> {
+    const token = await this.ctx.credentials.resolve(credentialRef('DEEPSEEK_PLATFORM_TOKEN'))
+    if (token === undefined) return undefined
+    const headers: Record<string, string> = { authorization: `Bearer ${token.value}`, accept: 'application/json' }
+    const waf = await this.ctx.credentials.resolve(credentialRef('DEEPSEEK_PLATFORM_WAF_TOKEN'))
+    if (waf !== undefined) headers['x-aws-waf-token'] = waf.value
+    return headers
+  }
+
+  private async refreshOfficialUsage(): Promise<void> {
+    const headers = await this.platformHeaders()
+    if (headers === undefined) return
+    const now = new Date()
+    const merged = new Map<string, OfficialDay>()
+    for (const offset of [0, 1]) {
+      const d = new Date(now.getFullYear(), now.getMonth() - offset, 1)
+      await this.fetchMonth(d.getFullYear(), d.getMonth() + 1, headers, merged)
+    }
+    if (merged.size === 0) return
+    // The platform returns the whole month's days, including future days with
+    // zero usage. Drop them so "today" and the trend stop at the current date.
+    const todayMs = dayKeyToMs(localDayKey(Date.now()))
+    this.officialDays = [...merged.values()]
+      .filter(day => dayKeyToMs(day.date) <= todayMs)
+      .sort((a, b) => dayKeyToMs(a.date) - dayKeyToMs(b.date))
+  }
+
+  private async fetchMonth(
+    year: number,
+    month: number,
+    headers: Record<string, string>,
+    merged: Map<string, OfficialDay>,
+  ): Promise<void> {
+    const amountUrl = `${PLATFORM_BASE}/api/v0/usage/amount?month=${month}&year=${year}`
+    const costUrl = `${PLATFORM_BASE}/api/v0/usage/cost?month=${month}&year=${year}`
+    let amountBody: PlatformUsageBody | undefined
+    let costBody: PlatformUsageBody | undefined
+    try {
+      const [amountRes, costRes] = await Promise.all([
+        fetch(amountUrl, { headers }),
+        fetch(costUrl, { headers }),
+      ])
+      if (amountRes.ok) amountBody = (await amountRes.json()) as PlatformUsageBody
+      if (costRes.ok) costBody = (await costRes.json()) as PlatformUsageBody
+    } catch {
+      return
+    }
+    const amountDays = extractDays(amountBody)
+    const costDays = extractDays(costBody)
+    for (const day of amountDays) {
+      const date = day.date
+      if (date === undefined) continue
+      let inputTokens = 0
+      let cacheReadTokens = 0
+      let outputTokens = 0
+      let requests = 0
+      for (const entry of day.data ?? []) {
+        for (const u of entry.usage ?? []) {
+          const n = Number(u.amount) || 0
+          if (u.type === 'PROMPT_CACHE_HIT_TOKEN') cacheReadTokens += n
+          else if (u.type === 'PROMPT_CACHE_MISS_TOKEN') inputTokens += n
+          else if (u.type === 'RESPONSE_TOKEN') outputTokens += n
+          else if (u.type === 'REQUEST') requests += n
+        }
+      }
+      const cur = merged.get(date) ?? { date, cost: 0, inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, requests: 0 }
+      merged.set(date, { ...cur, inputTokens, cacheReadTokens, outputTokens, requests })
+    }
+    for (const day of costDays) {
+      const date = day.date
+      if (date === undefined) continue
+      let cost = 0
+      for (const entry of day.data ?? []) {
+        for (const u of entry.usage ?? []) cost += Number(u.amount) || 0
+      }
+      const cur = merged.get(date) ?? { date, cost: 0, inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, requests: 0 }
+      merged.set(date, { ...cur, cost })
     }
   }
 
@@ -300,6 +423,7 @@ export default class DeepSeekUsageWidgetService extends Service {
       balance: this.balance,
       position: this.position,
       days,
+      officialDays: this.officialDays,
       pricing: { currency: 'CNY', estimated: true },
     }
   }
@@ -331,7 +455,7 @@ export default class DeepSeekUsageWidgetService extends Service {
 
   private async serveRefresh(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method !== 'POST') { res.writeHead(405); res.end(); return }
-    await this.refreshBalance()
+    await Promise.all([this.refreshBalance(), this.refreshOfficialUsage()])
     const body = JSON.stringify(this.snapshot())
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-cache' })
     res.end(body)

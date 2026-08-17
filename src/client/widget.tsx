@@ -22,7 +22,7 @@ interface DayPoint {
   inputTokens: number
   cacheReadTokens: number
   outputTokens: number
-  reasoningTokens: number
+  reasoningTokens?: number
   requests: number
   cost: number
 }
@@ -31,10 +31,11 @@ interface Snapshot {
   balance: BalanceState
   position: { x: number; y: number }
   days: DayPoint[]
+  officialDays?: DayPoint[]
   pricing?: { currency: string; estimated: boolean }
 }
 
-const EMPTY: Snapshot = { balance: { kind: 'loading' }, position: { x: 24, y: 24 }, days: [] }
+const EMPTY: Snapshot = { balance: { kind: 'loading' }, position: { x: 24, y: 24 }, days: [], officialDays: [] }
 
 function fmtMoney(value: number | undefined, currency: string | undefined): string {
   if (value === undefined) return '--.--'
@@ -154,16 +155,17 @@ export function FloatingWidget(): React.ReactNode {
     window.addEventListener('pointerup', up)
   }, [expanded, pos, savePosition])
 
-  const today = snapshot.days[snapshot.days.length - 1]
-  const series = useMemo(() => {
+  const isOfficial = (snapshot.officialDays?.length ?? 0) > 0
+  const effectiveDays = isOfficial ? (snapshot.officialDays ?? []) : snapshot.days
+  const today = effectiveDays[effectiveDays.length - 1]
+  const rangeDays = useMemo(() => {
     const n = range === '7d' ? 7 : 30
-    const tail = snapshot.days.slice(-n)
-    return tail.map(d => ({ date: d.date, value: metric === 'cost' ? d.cost : d.outputTokens + d.inputTokens + d.cacheReadTokens }))
-  }, [snapshot.days, range, metric])
+    return effectiveDays.slice(-n)
+  }, [effectiveDays, range])
 
-  const totalCost = sum(snapshot.days, d => d.cost)
-  const totalTokens = sum(snapshot.days, d => d.inputTokens + d.cacheReadTokens + d.outputTokens)
-  const totalRequests = sum(snapshot.days, d => d.requests)
+  const totalCost = sum(effectiveDays, d => d.cost)
+  const totalTokens = sum(effectiveDays, d => d.inputTokens + d.cacheReadTokens + d.outputTokens)
+  const totalRequests = sum(effectiveDays, d => d.requests)
 
   const balance = snapshot.balance
   const available = balance.kind === 'success' ? balance.available === true : undefined
@@ -230,7 +232,7 @@ export function FloatingWidget(): React.ReactNode {
               <span>Cache hit {fmtTokens(today?.cacheReadTokens ?? 0)}</span>
               <span>Cache miss {fmtTokens(today?.inputTokens ?? 0)}</span>
               <span>Output {fmtTokens(today?.outputTokens ?? 0)}</span>
-              <span>Reasoning {fmtTokens(today?.reasoningTokens ?? 0)}</span>
+              {!isOfficial && <span>Reasoning {fmtTokens(today?.reasoningTokens ?? 0)}</span>}
             </div>
           </section>
 
@@ -244,10 +246,10 @@ export function FloatingWidget(): React.ReactNode {
                 <button type="button" data-active={range === '30d'} onClick={() => { setRange('30d') }}>30d</button>
               </div>
             </div>
-            <Trend series={series} />
+            <Trend days={rangeDays} metric={metric} />
             <div className={css.totals}>
               <span>Total cost {totalCost.toFixed(4)} · Tokens {fmtTokens(totalTokens)} · Requests {totalRequests}</span>
-              {snapshot.pricing?.estimated ? <span className={css.estimate}>Estimated / local usage</span> : null}
+              <span className={css.estimate}>{isOfficial ? '官方数据 Official' : '本地估算 Estimated / local usage'}</span>
             </div>
           </section>
         </div>
@@ -256,18 +258,77 @@ export function FloatingWidget(): React.ReactNode {
   )
 }
 
-function Trend({ series }: { series: Array<{ date: string; value: number }> }): React.ReactNode {
-  const width = 440
-  const height = 96
-  const max = Math.max(1, ...series.map(s => s.value))
-  const n = series.length
-  const step = n > 1 ? width / (n - 1) : width
-  const points = series.map((s, i) => `${(i * step).toFixed(1)},${(height - 6 - (s.value / max) * (height - 16)).toFixed(1)}`).join(' ')
-  const area = `0,${height} ${points} ${width},${height}`
+function fmtAxis(value: number, metric: 'cost' | 'tokens'): string {
+  return metric === 'cost' ? `¥${value.toFixed(2)}` : fmtTokens(value)
+}
+
+function Trend({ days, metric }: { days: DayPoint[]; metric: 'cost' | 'tokens' }): React.ReactNode {
+  const [hover, setHover] = useState<number | null>(null)
+  const W = 440
+  const H = 160
+  const padL = 44
+  const padR = 10
+  const padT = 10
+  const padB = 22
+  const plotW = W - padL - padR
+  const plotH = H - padT - padB
+  const n = days.length
+
+  const values = days.map(d => metric === 'cost' ? d.cost : d.outputTokens + d.inputTokens + d.cacheReadTokens)
+  const max = Math.max(1, ...values)
+
+  const xOf = (i: number) => n <= 1 ? padL + plotW / 2 : padL + (i / (n - 1)) * plotW
+  const yOf = (v: number) => padT + plotH - (v / max) * plotH
+
+  const linePath = n === 0 ? '' : values.map((v, i) => `${i === 0 ? 'M' : 'L'}${xOf(i).toFixed(1)},${yOf(v).toFixed(1)}`).join(' ')
+  const areaPath = n === 0 ? '' : `M${xOf(0).toFixed(1)},${padT + plotH} ` + values.map((v, i) => `L${xOf(i).toFixed(1)},${yOf(v).toFixed(1)}`).join(' ') + ` L${xOf(n - 1).toFixed(1)},${padT + plotH} Z`
+
+  const onMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (n === 0) return
+    const rect = e.currentTarget.getBoundingClientRect()
+    const ratio = ((e.clientX - rect.left) - padL) / plotW
+    const idx = Math.round(ratio * (n - 1))
+    setHover(Math.max(0, Math.min(n - 1, idx)))
+  }
+
+  const hovered = hover !== null && hover < n ? days[hover] : undefined
+  const hoverTokens = hovered !== undefined ? hovered.outputTokens + hovered.inputTokens + hovered.cacheReadTokens : 0
+  const tooltipLeft = hover !== null && n > 0 ? Math.max(0, Math.min(xOf(hover) - 80, W - 168)) : 0
+
   return (
-    <svg viewBox={`0 0 ${width} ${height}`} className={css.chart} preserveAspectRatio="none">
-      <polygon points={area} className={css.chartArea} />
-      <polyline points={points} className={css.chartLine} />
-    </svg>
+    <div className={css.chartWrap} onMouseMove={onMove} onMouseLeave={() => { setHover(null) }}>
+      <svg viewBox={`0 0 ${W} ${H}`} className={css.chart} preserveAspectRatio="none">
+        {[0, 0.5, 1].map((t, i) => {
+          const y = padT + plotH - t * plotH
+          return (
+            <g key={i}>
+              <line x1={padL} y1={y} x2={W - padR} y2={y} className={css.gridLine} />
+              <text x={padL - 6} y={y + 3} className={css.axisLabel} textAnchor="end">{fmtAxis(t * max, metric)}</text>
+            </g>
+          )
+        })}
+        {n > 0 && [0, Math.floor((n - 1) / 2), n - 1].map((i) => {
+          const d = days[i]
+          if (d === undefined) return null
+          return <text key={i} x={xOf(i)} y={H - 6} className={css.axisLabel} textAnchor="middle">{d.date.slice(5)}</text>
+        })}
+        {n > 0 && <polygon points={areaPath} className={css.chartArea} />}
+        {n > 0 && <path d={linePath} className={css.chartLine} fill="none" />}
+        {hover !== null && n > 0 && (
+          <line x1={xOf(hover)} y1={padT} x2={xOf(hover)} y2={padT + plotH} className={css.hoverLine} />
+        )}
+        {hover !== null && n > 0 && (
+          <circle cx={xOf(hover)} cy={yOf(values[hover] ?? 0)} r={3.5} className={css.hoverDot} />
+        )}
+      </svg>
+      {hovered !== undefined && (
+        <div className={css.tooltip} style={{ left: tooltipLeft }}>
+          <div className={css.tooltipDate}>{hovered.date}</div>
+          <div className={css.tooltipRow}>花费 Cost：¥{hovered.cost.toFixed(4)}</div>
+          <div className={css.tooltipRow}>Tokens：{fmtTokens(hoverTokens)}</div>
+          <div className={css.tooltipRow}>请求 Requests：{hovered.requests}</div>
+        </div>
+      )}
+    </div>
   )
 }
