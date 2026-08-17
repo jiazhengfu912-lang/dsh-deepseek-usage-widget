@@ -1,3 +1,23 @@
 node_modules/
 lib/
 *.tsbuildinfo
+
+# ── Secrets & sensitive data — never commit these ──
+# Browser cookie exports (e.g. platform.deepseek.com_cookies.txt)
+*.cookies.txt
+cookies.txt
+*Cookie*.txt
+
+# DeepSeek Harness credential store (holds API keys / session tokens)
+.credentials.yaml
+.credentials*
+*credentials*.yaml
+
+# Tokens, keys, environment files
+*.token
+*userToken*
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
