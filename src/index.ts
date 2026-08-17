@@ -3,10 +3,11 @@
  *
  * Owns everything secret or durable: resolves `DEEPSEEK_API_KEY` through the
  * credentials seam, fetches the official balance endpoint, incrementally folds
- * `assistant/message` usage events into per-day totals, persists both the
- * widget position and the daily cache through the storage domain, and serves
- * one JSON snapshot (plus a position write and a manual refresh) over three
- * package-owned HTTP routes. The API key never leaves this process.
+ * `assistant/message` usage events into per-day, per-model totals, prices each
+ * model with its own official rates, persists both the widget position and the
+ * daily cache through the storage domain, and serves one JSON snapshot (plus a
+ * position write and a manual refresh) over three package-owned HTTP routes.
+ * The API key never leaves this process.
  *
  * @module @deepseek-ai/dsh-deepseek-usage-widget
  */
@@ -25,12 +26,28 @@ const BALANCE_ENDPOINT = 'https://api.deepseek.com/user/balance'
 const BALANCE_REFRESH_MS = 60_000
 const PERSIST_DEBOUNCE_MS = 2_000
 
-/** Official unit prices (CNY per 1M tokens), base flat rates. */
-const INPUT_PRICE = 1.0
-const CACHE_HIT_PRICE = 0.02
-const OUTPUT_PRICE = 2.0
+interface ModelPricing {
+  /** CNY per 1M input tokens (cache miss). */
+  input: number
+  /** CNY per 1M cache-hit tokens. */
+  cacheHit: number
+  /** CNY per 1M output tokens. */
+  output: number
+}
 
-/** One day's aggregated usage, persisted verbatim. */
+/**
+ * Official unit prices (CNY per 1M tokens), base flat rates.
+ * Unknown models fall back to the default (deepseek-v4-flash) rate.
+ */
+const PRICING: Record<string, ModelPricing> = {
+  'deepseek-v4-flash': { input: 1.0, cacheHit: 0.02, output: 2.0 },
+  'deepseek-v4-pro': { input: 3.0, cacheHit: 0.025, output: 6.0 },
+  'deepseek-chat': { input: 1.0, cacheHit: 0.1, output: 2.0 },
+  'deepseek-reasoner': { input: 4.0, cacheHit: 1.0, output: 16.0 },
+}
+const DEFAULT_MODEL = 'deepseek-v4-flash'
+
+/** One model's aggregated usage for one day, persisted verbatim. */
 const dailyUsageSchema = z.object({
   inputTokens: z.number().nonnegative(),
   cacheReadTokens: z.number().nonnegative(),
@@ -44,7 +61,7 @@ type DailyUsage = z.infer<typeof dailyUsageSchema>
 /** The single durable record: widget position plus the whole daily fold. */
 const stateSchema = z.object({
   position: z.object({ x: z.number(), y: z.number() }),
-  daily: z.record(z.string(), dailyUsageSchema),
+  daily: z.record(z.string(), z.record(z.string(), dailyUsageSchema)),
 })
 
 type WidgetState = z.infer<typeof stateSchema>
@@ -87,8 +104,9 @@ function dayKeyToMs(key: string): number {
   return new Date(y, m - 1, d).getTime()
 }
 
-function estimateCost(u: DailyUsage): number {
-  return (u.inputTokens * INPUT_PRICE + u.cacheReadTokens * CACHE_HIT_PRICE + u.outputTokens * OUTPUT_PRICE) / 1_000_000
+function estimateCost(u: DailyUsage, model: string): number {
+  const p = PRICING[model] ?? PRICING[DEFAULT_MODEL] ?? { input: 1.0, cacheHit: 0.02, output: 2.0 }
+  return (u.inputTokens * p.input + u.cacheReadTokens * p.cacheHit + u.outputTokens * p.output) / 1_000_000
 }
 
 export default class DeepSeekUsageWidgetService extends Service {
@@ -97,7 +115,8 @@ export default class DeepSeekUsageWidgetService extends Service {
   private domain?: Domain<typeof widgetDomainSpec>
   private table?: KvTable<string, WidgetState>
   private position: { x: number; y: number } = { x: 24, y: 24 }
-  private readonly daily = new Map<string, DailyUsage>()
+  private readonly daily = new Map<string, Map<string, DailyUsage>>()
+  private readonly modelBySession = new Map<string, string>()
   private balance: BalanceState = emptyBalance('no-key')
   private persistTimer: ReturnType<typeof setTimeout> | undefined
 
@@ -113,14 +132,18 @@ export default class DeepSeekUsageWidgetService extends Service {
     const stored = this.table.get('state')
     if (stored !== undefined) {
       this.position = stored.position
-      for (const [key, value] of Object.entries(stored.daily)) this.daily.set(key, value)
+      for (const [date, byModel] of Object.entries(stored.daily)) {
+        const modelMap = new Map<string, DailyUsage>()
+        for (const [model, usage] of Object.entries(byModel)) modelMap.set(model, usage)
+        this.daily.set(date, modelMap)
+      }
     }
 
     this.ctx.effect(() => () => {
       if (this.persistTimer !== undefined) clearTimeout(this.persistTimer)
       void this.domain?.close()
     }, 'deepseek-usage-widget: domain close')
-    this.ctx.on('session/event', (_session, event: SessionEvent) => { this.observe(event) })
+    this.ctx.on('session/event', (session, event: SessionEvent) => { this.observe(session.id, event) })
 
     this.ctx.effect(() => {
       const offSnapshot = this.ctx.webServer.register({
@@ -146,12 +169,22 @@ export default class DeepSeekUsageWidgetService extends Service {
     this.ctx.effect(() => () => { clearInterval(intervalId) }, 'deepseek-usage-widget: balance interval')
   }
 
-  private observe(event: SessionEvent): void {
+  private observe(sessionId: string, event: SessionEvent): void {
+    if (event.type === 'request/header') {
+      this.modelBySession.set(sessionId, event.data.header.config.model)
+      return
+    }
     if (event.type !== 'assistant/message') return
     const usage = event.data.usage
     if (usage === undefined) return
+    const model = this.modelBySession.get(sessionId) ?? DEFAULT_MODEL
     const key = localDayKey(event.time)
-    const prev = this.daily.get(key) ?? { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, reasoningTokens: 0, requests: 0 }
+    let byModel = this.daily.get(key)
+    if (byModel === undefined) {
+      byModel = new Map<string, DailyUsage>()
+      this.daily.set(key, byModel)
+    }
+    const prev = byModel.get(model) ?? { inputTokens: 0, cacheReadTokens: 0, outputTokens: 0, reasoningTokens: 0, requests: 0 }
     const next: DailyUsage = {
       inputTokens: prev.inputTokens + usage.inputTokens,
       cacheReadTokens: prev.cacheReadTokens + (usage.cacheReadTokens ?? 0),
@@ -159,7 +192,7 @@ export default class DeepSeekUsageWidgetService extends Service {
       reasoningTokens: prev.reasoningTokens + (usage.reasoningTokens ?? 0),
       requests: prev.requests + 1,
     }
-    this.daily.set(key, next)
+    byModel.set(model, next)
     this.schedulePersist()
   }
 
@@ -173,8 +206,12 @@ export default class DeepSeekUsageWidgetService extends Service {
 
   private persist(): void {
     if (this.table === undefined) return
-    const daily: Record<string, DailyUsage> = {}
-    for (const [key, value] of this.daily) daily[key] = value
+    const daily: Record<string, Record<string, DailyUsage>> = {}
+    for (const [date, byModel] of this.daily) {
+      const modelMap: Record<string, DailyUsage> = {}
+      for (const [model, usage] of byModel) modelMap[model] = usage
+      daily[date] = modelMap
+    }
     void this.table.put('state', { position: this.position, daily })
   }
 
@@ -232,20 +269,38 @@ export default class DeepSeekUsageWidgetService extends Service {
   }
 
   private snapshot(): unknown {
-    const days = [...this.daily.entries()].map(([date, u]) => ({
-      date,
-      inputTokens: u.inputTokens,
-      cacheReadTokens: u.cacheReadTokens,
-      outputTokens: u.outputTokens,
-      reasoningTokens: u.reasoningTokens,
-      requests: u.requests,
-      cost: estimateCost(u),
-    })).sort((a, b) => dayKeyToMs(a.date) - dayKeyToMs(b.date))
+    const days: Array<{
+      date: string
+      inputTokens: number
+      cacheReadTokens: number
+      outputTokens: number
+      reasoningTokens: number
+      requests: number
+      cost: number
+    }> = []
+    for (const [date, byModel] of this.daily) {
+      let inputTokens = 0
+      let cacheReadTokens = 0
+      let outputTokens = 0
+      let reasoningTokens = 0
+      let requests = 0
+      let cost = 0
+      for (const [model, u] of byModel) {
+        inputTokens += u.inputTokens
+        cacheReadTokens += u.cacheReadTokens
+        outputTokens += u.outputTokens
+        reasoningTokens += u.reasoningTokens
+        requests += u.requests
+        cost += estimateCost(u, model)
+      }
+      days.push({ date, inputTokens, cacheReadTokens, outputTokens, reasoningTokens, requests, cost })
+    }
+    days.sort((a, b) => dayKeyToMs(a.date) - dayKeyToMs(b.date))
     return {
       balance: this.balance,
       position: this.position,
       days,
-      pricing: { input: INPUT_PRICE, cacheHit: CACHE_HIT_PRICE, output: OUTPUT_PRICE, currency: 'CNY', estimated: true },
+      pricing: { currency: 'CNY', estimated: true },
     }
   }
 
