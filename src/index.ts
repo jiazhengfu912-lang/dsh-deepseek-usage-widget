@@ -130,7 +130,12 @@ export default class DeepSeekUsageWidgetService extends Service {
         path: '/deepseek-usage/position',
         handler: (req, res) => { void this.servePosition(req, res) },
       })
-      return () => { offSnapshot(); offPosition() }
+      const offRefresh = this.ctx.webServer.register({
+        kind: 'exact',
+        path: '/deepseek-usage/refresh',
+        handler: (req, res) => { void this.serveRefresh(req, res) },
+      })
+      return () => { offSnapshot(); offPosition(); offRefresh() }
     }, 'deepseek-usage-widget: routes')
 
     await this.refreshBalance()
@@ -264,5 +269,13 @@ export default class DeepSeekUsageWidgetService extends Service {
       res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' })
       res.end(JSON.stringify({ ok: false, error: 'invalid JSON body' }))
     }
+  }
+
+  private async serveRefresh(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (req.method !== 'POST') { res.writeHead(405); res.end(); return }
+    await this.refreshBalance()
+    const body = JSON.stringify(this.snapshot())
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-cache' })
+    res.end(body)
   }
 }

@@ -72,23 +72,36 @@ export function FloatingWidget(): React.ReactNode {
     return () => { document.removeEventListener('pointerdown', onDown) }
   }, [expanded])
 
+  const applySnapshot = useCallback((data: Snapshot) => {
+    setSnapshot(data)
+    const p = data.position ?? { x: 24, y: 24 }
+    // Clamp into the current viewport so a persisted off-screen position
+    // (e.g. saved on a wider monitor) never hides the widget.
+    setPos({
+      x: Math.max(8, Math.min(window.innerWidth - 240, p.x)),
+      y: Math.max(8, Math.min(window.innerHeight - 120, p.y)),
+    })
+  }, [])
+
   const load = useCallback(async () => {
     try {
       const res = await fetch('/deepseek-usage/snapshot')
       if (!res.ok) return
-      const data = (await res.json()) as Snapshot
-      setSnapshot(data)
-      const p = data.position ?? { x: 24, y: 24 }
-      // Clamp into the current viewport so a persisted off-screen position
-      // (e.g. saved on a wider monitor) never hides the widget.
-      setPos({
-        x: Math.max(8, Math.min(window.innerWidth - 240, p.x)),
-        y: Math.max(8, Math.min(window.innerHeight - 120, p.y)),
-      })
+      applySnapshot((await res.json()) as Snapshot)
     } catch {
       /* keep last-good */
     }
-  }, [])
+  }, [applySnapshot])
+
+  const refresh = useCallback(async () => {
+    try {
+      const res = await fetch('/deepseek-usage/refresh', { method: 'POST' })
+      if (!res.ok) return
+      applySnapshot((await res.json()) as Snapshot)
+    } catch {
+      /* keep last-good */
+    }
+  }, [applySnapshot])
 
   useEffect(() => {
     void load()
@@ -191,7 +204,7 @@ export function FloatingWidget(): React.ReactNode {
                   ? `Last updated ${new Date(balance.updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
                   : ''}
               </span>
-              <button type="button" onClick={() => { void load() }}>Refresh</button>
+              <button type="button" onClick={() => { void refresh() }}>Refresh</button>
             </div>
           </header>
 
