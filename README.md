@@ -1,5 +1,7 @@
 # DeepSeek Usage Widget
 
+English | [中文](README.zh.md)
+
 A floating usage widget for the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) Web UI. It shows your real DeepSeek API balance and locally-aggregated token usage as a draggable, morphing overlay card.
 
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
